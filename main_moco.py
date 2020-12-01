@@ -8,6 +8,7 @@ import random
 import shutil
 import time
 import warnings
+import logging
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,10 @@ import torchvision.models as models
 
 import moco.loader
 import moco.builder
+
+from template_lib.v2.config_cfgnode import update_parser_defaults_from_yaml, global_cfg
+from template_lib.modelarts import modelarts_utils
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -99,7 +104,15 @@ parser.add_argument('--cos', action='store_true',
 
 
 def main():
+    modelarts_utils.setup_tl_outdir_obs(global_cfg)
+    modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
+    modelarts_utils.prepare_dataset(global_cfg.get('modelarts_download', {}), global_cfg=global_cfg)
+
+    update_parser_defaults_from_yaml(parser)
     args = parser.parse_args()
+
+    # modelarts_utils.prepare_dataset(global_cfg.get('modelarts_upload', {}), global_cfg=global_cfg, download=False)
+    # modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -135,7 +148,9 @@ def main():
 
 def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
-
+    if args.gpu == 0:
+        update_parser_defaults_from_yaml(parser)
+    logger = logging.getLogger('tl')
     # suppress printing if not master
     if args.multiprocessing_distributed and args.gpu != 0:
         def print_pass(*args):
@@ -159,7 +174,7 @@ def main_worker(gpu, ngpus_per_node, args):
     model = moco.builder.MoCo(
         models.__dict__[args.arch],
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
-    print(model)
+    logger.info(model)
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
