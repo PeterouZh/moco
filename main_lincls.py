@@ -8,6 +8,7 @@ import shutil
 import time
 import warnings
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -20,6 +21,10 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+
+from template_lib.v2.config_cfgnode import update_parser_defaults_from_yaml, global_cfg
+from template_lib.modelarts import modelarts_utils
+from template_lib.v2.logger import summary_dict2txtfig, global_textlogger
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -84,7 +89,12 @@ best_acc1 = 0
 
 
 def main():
+    update_parser_defaults_from_yaml(parser)
     args = parser.parse_args()
+    global_cfg.merge_from_dict(vars(args))
+    modelarts_utils.setup_tl_outdir_obs(global_cfg)
+    modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
+    modelarts_utils.prepare_dataset(global_cfg.get('modelarts_download', {}), global_cfg=global_cfg)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -121,6 +131,11 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
+    if args.gpu == 0:
+        update_parser_defaults_from_yaml(parser)
+        global_cfg.merge_from_dict(vars(args))
+        modelarts_utils.setup_tl_outdir_obs(global_cfg)
+        modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
 
     # suppress printing if not master
     if args.multiprocessing_distributed and args.gpu != 0:
@@ -274,6 +289,20 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
+        print("=> loading checkpoint '{}'".format(args.pretrained))
+        checkpoint = torch.load(args.pretrained, map_location="cpu")
+
+        # rename moco pre-trained keys
+        state_dict = checkpoint['state_dict']
+        for k in list(state_dict.keys()):
+            # retain only encoder_q up to before the embedding layer
+            if k.startswith('module.encoder_q'):
+                # remove prefix
+                state_dict['module.' + k[len("module.encoder_q."):]] = state_dict[k]
+            # delete renamed or unused k
+            del state_dict[k]
+
+        msg = model.load_state_dict(state_dict, strict=False)
         validate(val_loader, model, criterion, args)
         return
 
@@ -288,6 +317,9 @@ def main_worker(gpu, ngpus_per_node, args):
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
 
+        summary_dict2txtfig({'top1': acc1.item()}, prefix='eval', step=epoch,
+                            textlogger=global_textlogger, is_main_process=(args.gpu == 0))
+
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
@@ -300,9 +332,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
+            }, is_best, filename=f"{args.tl_ckptdir}/checkpoint.pth.tar")
+            modelarts_utils.modelarts_sync_results_dir(global_cfg, join=False, is_main_process=(args.gpu == 0))
             if epoch == args.start_epoch:
                 sanity_check(model.state_dict(), args.pretrained)
+    modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True, is_main_process=(args.gpu == 0))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -325,8 +359,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     """
     model.eval()
 
+    global_itr = epoch * len(train_loader)
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
+        global_itr += 1
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -355,9 +391,28 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            if args.gpu == 0:
+                summary_d = {
+                    "Loss": losses.val,
+                    "top1": top1.val,
+                    "top5": top5.val
+                }
+                summary_dict2txtfig(summary_d, prefix='itr', step=global_itr,
+                                    textlogger=global_textlogger)
+            if args.tl_debug: break
+
+    if args.gpu == 0:
+        summary_d = {
+            "Loss": losses.avg,
+            "top1": top1.avg,
+            "top5": top5.avg
+        }
+        summary_dict2txtfig(summary_d, prefix='epoch', step=global_itr,
+                            textlogger=global_textlogger)
 
 
 def validate(val_loader, model, criterion, args):
+    logger = logging.getLogger('tl')
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -393,19 +448,18 @@ def validate(val_loader, model, criterion, args):
 
             if i % args.print_freq == 0:
                 progress.display(i)
+                if args.tl_debug: break
 
         # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
+        logger.info(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+                    .format(top1=top1, top5=top5))
 
     return top1.avg
-
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
-
+        shutil.copyfile(filename, f'{os.path.dirname(filename)}/model_best.pth.tar')
 
 def sanity_check(state_dict, pretrained_weights):
     """

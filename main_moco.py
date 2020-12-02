@@ -105,12 +105,12 @@ parser.add_argument('--cos', action='store_true',
 
 
 def main():
+    update_parser_defaults_from_yaml(parser)
+    args = parser.parse_args()
+    global_cfg.merge_from_dict(vars(args))
     modelarts_utils.setup_tl_outdir_obs(global_cfg)
     modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
     modelarts_utils.prepare_dataset(global_cfg.get('modelarts_download', {}), global_cfg=global_cfg)
-
-    update_parser_defaults_from_yaml(parser)
-    args = parser.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
