@@ -28,6 +28,7 @@ import moco.builder
 
 from template_lib.v2.config_cfgnode import update_parser_defaults_from_yaml, global_cfg
 from template_lib.modelarts import modelarts_utils
+from template_lib.v2.logger import summary_dict2txtfig, global_textlogger
 
 
 model_names = sorted(name for name in models.__dict__
@@ -147,6 +148,10 @@ def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
     if args.gpu == 0:
         update_parser_defaults_from_yaml(parser)
+        global_cfg.merge_from_dict(vars(args))
+        modelarts_utils.setup_tl_outdir_obs(global_cfg)
+        modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
+
     logger = logging.getLogger('tl')
     # suppress printing if not master
     if args.multiprocessing_distributed and args.gpu != 0:
@@ -286,7 +291,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+            }, is_best=False, filename=f'{args.tl_ckptdir}/checkpoint_{epoch:04d}.pth.tar')
+            modelarts_utils.modelarts_sync_results_dir(global_cfg, join=False, is_main_process=(args.gpu == 0))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -303,8 +309,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     # switch to train mode
     model.train()
 
+    global_itr = epoch * len(train_loader)
+
     end = time.time()
     for i, (images, _) in enumerate(train_loader):
+        global_itr += 1
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -334,12 +343,30 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            if args.gpu == 0:
+                summary_d = {
+                    "Loss": losses.val,
+                    "top1": top1.val,
+                    "top5": top5.val
+                }
+                summary_dict2txtfig(summary_d, prefix='itr', step=global_itr,
+                                    textlogger=global_textlogger)
+
+    if args.gpu == 0:
+        summary_d = {
+            "Loss": losses.avg,
+            "top1": top1.avg,
+            "top5": top5.avg
+        }
+        summary_dict2txtfig(summary_d, prefix='epoch', step=global_itr,
+                            textlogger=global_textlogger)
+
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, f'{os.path.dirname(filename)}/model_best.pth.tar')
 
 
 class AverageMeter(object):
