@@ -111,9 +111,6 @@ def main():
     update_parser_defaults_from_yaml(parser)
     args = parser.parse_args()
 
-    # modelarts_utils.prepare_dataset(global_cfg.get('modelarts_upload', {}), global_cfg=global_cfg, download=False)
-    # modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
-
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -175,6 +172,8 @@ def main_worker(gpu, ngpus_per_node, args):
         models.__dict__[args.arch],
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     logger.info(model)
+
+    modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True, is_main_process=(args.gpu==0))
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
