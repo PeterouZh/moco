@@ -26,6 +26,9 @@ from template_lib.v2.config_cfgnode import update_parser_defaults_from_yaml, glo
 from template_lib.modelarts import modelarts_utils
 from template_lib.v2.logger import summary_dict2txtfig, global_textlogger
 
+from exp.comm.evaluation import EvalImageNet
+
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -131,9 +134,9 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
+    update_parser_defaults_from_yaml(parser, is_main_process=(gpu==0))
+    logger = logging.getLogger('tl')
     if args.gpu == 0:
-        update_parser_defaults_from_yaml(parser)
-        global_cfg.merge_from_dict(vars(args))
         modelarts_utils.setup_tl_outdir_obs(global_cfg)
         modelarts_utils.modelarts_sync_results_dir(global_cfg, join=True)
 
@@ -156,7 +159,7 @@ def main_worker(gpu, ngpus_per_node, args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
     # create model
-    print("=> creating model '{}'".format(args.arch))
+    logger.info("=> creating model '{}'".format(args.arch))
     model = models.__dict__[args.arch]()
 
     # freeze all layers but the last fc
@@ -166,11 +169,12 @@ def main_worker(gpu, ngpus_per_node, args):
     # init the fc layer
     model.fc.weight.data.normal_(mean=0.0, std=0.01)
     model.fc.bias.data.zero_()
+    logger.info(model)
 
     # load from pre-trained, before DistributedDataParallel constructor
     if args.pretrained:
         if os.path.isfile(args.pretrained):
-            print("=> loading checkpoint '{}'".format(args.pretrained))
+            logger.info("=> loading checkpoint '{}'".format(args.pretrained))
             checkpoint = torch.load(args.pretrained, map_location="cpu")
 
             # rename moco pre-trained keys
@@ -187,7 +191,7 @@ def main_worker(gpu, ngpus_per_node, args):
             msg = model.load_state_dict(state_dict, strict=False)
             assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
 
-            print("=> loaded pre-trained model '{}'".format(args.pretrained))
+            logger.info("=> loaded pre-trained model '{}'".format(args.pretrained))
         else:
             print("=> no checkpoint found at '{}'".format(args.pretrained))
 
@@ -278,33 +282,38 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    # val_loader = torch.utils.data.DataLoader(
+    #     datasets.ImageFolder(valdir, transforms.Compose([
+    #         transforms.Resize(256),
+    #         transforms.CenterCrop(224),
+    #         transforms.ToTensor(),
+    #         normalize,
+    #     ])),
+    #     batch_size=args.batch_size, shuffle=False,
+    #     num_workers=args.workers, pin_memory=True)
+
+    evaldir = os.path.join(args.data, 'val')
+    eval_imagenet = EvalImageNet(valdir=evaldir, gpu_id=gpu)
 
     if args.evaluate:
-        print("=> loading checkpoint '{}'".format(args.pretrained))
-        checkpoint = torch.load(args.pretrained, map_location="cpu")
-
-        # rename moco pre-trained keys
-        state_dict = checkpoint['state_dict']
-        for k in list(state_dict.keys()):
-            # retain only encoder_q up to before the embedding layer
-            if k.startswith('module.encoder_q'):
-                # remove prefix
-                state_dict['module.' + k[len("module.encoder_q."):]] = state_dict[k]
-            # delete renamed or unused k
-            del state_dict[k]
-
-        msg = model.load_state_dict(state_dict, strict=False)
-        validate(val_loader, model, criterion, args)
+        eval_imagenet.validate(model=model, epoch=0)
         return
+        # print("=> loading checkpoint '{}'".format(args.pretrained))
+        # checkpoint = torch.load(args.pretrained, map_location="cpu")
+        #
+        # # rename moco pre-trained keys
+        # state_dict = checkpoint['state_dict']
+        # for k in list(state_dict.keys()):
+        #     # retain only encoder_q up to before the embedding layer
+        #     if k.startswith('module.encoder_q'):
+        #         # remove prefix
+        #         state_dict['module.' + k[len("module.encoder_q."):]] = state_dict[k]
+        #     # delete renamed or unused k
+        #     del state_dict[k]
+        #
+        # msg = model.load_state_dict(state_dict, strict=False)
+        # validate(val_loader, model, criterion, args)
+        # return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -315,10 +324,10 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-
-        summary_dict2txtfig({'top1': acc1.item()}, prefix='eval', step=epoch,
-                            textlogger=global_textlogger, is_main_process=(args.gpu == 0))
+        # acc1 = validate(val_loader, model, criterion, args)
+        # summary_dict2txtfig({'top1': acc1.item()}, prefix='eval', step=epoch,
+        #                     textlogger=global_textlogger, is_main_process=(args.gpu == 0))
+        acc1 = eval_imagenet.validate(model=model, epoch=epoch)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
