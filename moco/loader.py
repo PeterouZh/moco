@@ -50,6 +50,15 @@ class ThreeCropsTransform:
         return [q, k, g]
 
 
+class ValGANTransform:
+  def __init__(self, val_transform, gan_transform):
+    self.val_transform = val_transform
+    self.gan_transform = gan_transform
+
+  def __call__(self, x):
+    img_v = self.val_transform(x)
+    img_g = self.gan_transform(x)
+    return [img_v, img_g]
 
 class GaussianBlur(object):
     """Gaussian blur augmentation in SimCLR https://arxiv.org/abs/2002.05709"""
